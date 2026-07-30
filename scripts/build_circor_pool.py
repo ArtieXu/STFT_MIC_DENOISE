@@ -2,13 +2,13 @@
 """Build the CirCor clean-heart-sound pool. Run once, locally or in Colab.
 
     # get the data (449 MB, PhysioNet must be reachable)
-    wget -O circor.zip https://physionet.org/content/circor-heart-sound/get-zip/1.0.3/
+    wget -c -O circor.zip https://physionet.org/content/circor-heart-sound/get-zip/1.0.3/
     unzip -q circor.zip
 
     # all eligible subjects, 12 windows each -- the default
     PYTHONPATH=. python scripts/build_circor_pool.py --root circor-heart-sound-1.0.3
 
-Writes ``data/circor/circor_pool_4khz_2s.npz`` plus a ``.manifest.json`` beside
+Writes ``data/circor/circor_pool_4khz_2s_v2.npz`` plus a ``.manifest.json`` beside
 it. Nothing else in this folder needs the raw CirCor tree afterwards.
 
 CirCor is 4 kHz 16-bit like this project's device recordings, so no resampling
@@ -23,6 +23,8 @@ the two that matter most:
     whose recordings did not meet the signal-quality standard.
 
 The split column is subject-disjoint, so train/val never share a subject.
+Patient ID aliases connected by the official ``Additional ID`` field are
+merged before per-subject limiting and splitting.
 """
 from __future__ import annotations
 
@@ -37,10 +39,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.circor import build_pool  # noqa: E402
+from src.circor import POOL_SCHEMA_VERSION, build_pool  # noqa: E402
 from src.pools import SAMPLE_RATE, WINDOW_SAMPLES  # noqa: E402
 
-DEFAULT_OUT = REPO_ROOT / "data" / "circor" / "circor_pool_4khz_2s.npz"
+DEFAULT_OUT = REPO_ROOT / "data" / "circor" / "circor_pool_4khz_2s_v2.npz"
 
 
 def main() -> None:
@@ -72,7 +74,7 @@ def main() -> None:
     if not (args.root / "training_data").is_dir():
         raise SystemExit(
             f"{args.root}/training_data not found. Download CirCor first:\n"
-            "  wget -O circor.zip https://physionet.org/content/circor-heart-sound/get-zip/1.0.3/\n"
+            "  wget -c -O circor.zip https://physionet.org/content/circor-heart-sound/get-zip/1.0.3/\n"
             "  unzip -q circor.zip"
         )
 
@@ -96,13 +98,19 @@ def main() -> None:
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
-        args.out, sample_rate=SAMPLE_RATE, window_samples=WINDOW_SAMPLES, **pool
+        args.out,
+        pool_schema_version=POOL_SCHEMA_VERSION,
+        sample_rate=SAMPLE_RATE,
+        window_samples=WINDOW_SAMPLES,
+        **pool,
     )
 
     split = pool["split"]
     print("\n" + "=" * 58)
     print(f"windows                 {stats['n_windows']}")
-    print(f"subjects                {stats['n_subjects']}")
+    print(f"subjects                {stats['n_subjects']} "
+          f"(from {stats['n_participant_ids']} Patient IDs; "
+          f"{stats['linked_id_groups']} linked-ID groups)")
     print(f"records                 {stats['n_records']} "
           f"({stats['n_records'] / stats['n_subjects']:.2f} per subject)")
     print(f"dropped subjects        {stats['dropped_subjects']}")
@@ -130,7 +138,9 @@ def main() -> None:
 
     manifest = args.out.with_suffix(".manifest.json")
     manifest.write_text(json.dumps(
-        {"source": "CirCor DigiScope 1.0.3", "annotated_states_only": True,
+        {"source": "CirCor DigiScope 1.0.3",
+         "pool_schema_version": POOL_SCHEMA_VERSION,
+         "annotated_states_only": True,
          "sample_rate": SAMPLE_RATE, "window_samples": WINDOW_SAMPLES,
          "args": {k: str(v) for k, v in vars(args).items()}, "stats": stats},
         indent=2) + "\n")

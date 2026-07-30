@@ -27,7 +27,7 @@ only inside contiguous nonzero-state runs.
 from __future__ import annotations
 
 import csv
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +35,8 @@ import numpy as np
 SR = 4000
 LOCATIONS = ("AV", "MV", "PV", "TV", "Phc")
 ANNOTATED_STATES = (1, 2, 3, 4)
+# v2 merges official Additional ID aliases before subject limiting/splitting.
+POOL_SCHEMA_VERSION = 2
 
 # Measured on this project's device clean recordings (adult).
 DEVICE_BPM_MEDIAN = 73.0
@@ -123,6 +125,57 @@ def load_metadata(root: Path) -> dict[str, dict]:
     return meta
 
 
+def _normalise_linked_id(value: object) -> str | None:
+    """Normalize the CSV's optional ``Additional ID`` field."""
+
+    linked = str(value).strip()
+    if linked.lower() in {"", "nan", "none", "na", "n/a"}:
+        return None
+    if linked.endswith(".0") and linked[:-2].isdigit():
+        linked = linked[:-2]
+    return linked
+
+
+def canonical_subject_map(metadata: dict[str, dict]) -> dict[str, str]:
+    """Merge Patient ID / Additional ID aliases for the same human.
+
+    CirCor assigns a second ID when one person participates in two campaigns.
+    Treating those aliases as separate subjects both breaks subject-disjoint
+    splitting and gives that person twice the sampling weight.
+    """
+
+    parent = {subject: subject for subject in metadata}
+
+    def find(subject: str) -> str:
+        while parent[subject] != subject:
+            parent[subject] = parent[parent[subject]]
+            subject = parent[subject]
+        return subject
+
+    def union(first: str, second: str) -> None:
+        first_root, second_root = find(first), find(second)
+        if first_root != second_root:
+            parent[second_root] = first_root
+
+    for subject, row in metadata.items():
+        linked = _normalise_linked_id(row.get("Additional ID", ""))
+        if linked in parent:
+            union(subject, linked)
+
+    groups: dict[str, list[str]] = defaultdict(list)
+    for subject in parent:
+        groups[find(subject)].append(subject)
+
+    def sort_key(subject: str) -> tuple[int, int | str]:
+        return (0, int(subject)) if subject.isdigit() else (1, subject)
+
+    result = {}
+    for aliases in groups.values():
+        canonical = min(aliases, key=sort_key)
+        result.update({alias: canonical for alias in aliases})
+    return result
+
+
 def spread_pick(offsets, count: int, min_gap: int, rng) -> list[int]:
     """Up to `count` offsets, each at least `min_gap` samples from the others."""
     pool = list(offsets)
@@ -167,13 +220,15 @@ def build_pool(
     metadata = load_metadata(root)
     rng = np.random.default_rng(seed)
 
-    by_subject: dict[str, list[Path]] = defaultdict(list)
+    raw_by_subject: dict[str, list[Path]] = defaultdict(list)
     for wav in sorted(data_dir.glob("*.wav")):
-        by_subject[parse_record_name(wav.stem)[0]].append(wav)
+        raw_by_subject[parse_record_name(wav.stem)[0]].append(wav)
 
-    eligible, dropped = [], {"unknown_murmur": 0, "no_metadata": 0, "murmur_filter": 0}
-    for subject in sorted(by_subject):
-        row = metadata.get(subject)
+    canonical_by_id = canonical_subject_map(metadata)
+    by_subject: dict[str, list[Path]] = defaultdict(list)
+    dropped = {"unknown_murmur": 0, "no_metadata": 0, "murmur_filter": 0}
+    for participant_id in sorted(raw_by_subject):
+        row = metadata.get(participant_id)
         if row is None:
             dropped["no_metadata"] += 1
             continue
@@ -187,7 +242,10 @@ def build_pool(
         if murmur == "present" and value != "Present":
             dropped["murmur_filter"] += 1
             continue
-        eligible.append(subject)
+        canonical = canonical_by_id.get(participant_id, participant_id)
+        by_subject[canonical].extend(raw_by_subject[participant_id])
+
+    eligible = sorted(by_subject)
     rng.shuffle(eligible)
 
     window_samples = int(round(window_seconds * SR))
@@ -207,8 +265,9 @@ def build_pool(
             rows = read_tsv_rows(tsv)
             bpm = heart_rate_bpm(rows)
             record_bpm[wav.stem] = bpm
-            if heart_rate_max is not None and bpm == bpm:  # not NaN
-                if bpm > heart_rate_max or bpm < heart_rate_min:
+            if bpm == bpm:  # not NaN
+                outside_max = heart_rate_max is not None and bpm > heart_rate_max
+                if outside_max or bpm < heart_rate_min:
                     dropped_hr += 1
                     continue
             offsets = candidate_offsets(
@@ -251,7 +310,8 @@ def build_pool(
                 audio = audio.mean(axis=1)
             audio = audio.astype(np.float32) / 32768.0
             location = parse_record_name(wav.stem)[1]
-            row = metadata[subject]
+            participant_id = parse_record_name(wav.stem)[0]
+            row = metadata[participant_id]
             for offset in offsets:
                 if offset + window_samples > len(audio):
                     continue
@@ -265,6 +325,7 @@ def build_pool(
                 windows.append(window)
                 provenance.append({
                     "subject": subject,
+                    "participant_id": participant_id,
                     "location": location,
                     "record": wav.stem,
                     "offset": offset,
@@ -296,6 +357,7 @@ def build_pool(
     pool = {
         "x": np.stack(windows).astype(np.float32),
         "subject": subjects,
+        "participant_id": np.asarray([p["participant_id"] for p in provenance]),
         "location": np.asarray([p["location"] for p in provenance]),
         "record": np.asarray([p["record"] for p in provenance]),
         "offset": np.asarray([p["offset"] for p in provenance], dtype=np.int64),
@@ -310,6 +372,14 @@ def build_pool(
         "n_windows": len(windows),
         "n_subjects": len(unique),
         "n_records": len(set(pool["record"].tolist())),
+        "n_participant_ids": len(set(pool["participant_id"].tolist())),
+        "linked_id_groups": int(sum(
+            count > 1
+            for count in Counter(
+                canonical_by_id.get(participant_id, participant_id)
+                for participant_id in set(pool["participant_id"].tolist())
+            ).values()
+        )),
         "dropped_subjects": dropped,
         "dropped_records_by_heart_rate": dropped_hr,
         "bpm_median": float(np.median(finite)) if len(finite) else None,

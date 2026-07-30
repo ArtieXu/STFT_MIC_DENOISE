@@ -2,7 +2,8 @@
 
 Two clean sources feed this pipeline and they arrive in different shapes:
 
-    device   data/clean/step_1s/{train,val}/*.npz   int16, full scale 32768,
+    device   data/clean/step_1s/{train,val,test}/*.npz
+                                                    int16, full scale 32768,
                                                     2 s windows @ 4 kHz, 1 s hop
     CirCor   data/circor/circor_pool_*.npz          float32 in +-1, already
                                                     DC-removed and quality
@@ -11,18 +12,15 @@ Two clean sources feed this pipeline and they arrive in different shapes:
 They are *not* interchangeable as stored. Measured on this project's data:
 
     pool                     median window RMS
-    device clean / train           0.00072
-    device clean / val             0.00025      <-- 2.9x quieter than train
-    device noise / train           0.00750
-    device noise / val             0.00476
+    device clean                   0.00025-0.00072
+    device noise                   0.00476-0.00750
     CirCor (digital stethoscope)   ~0.02        <-- 30-100x louder than device
 
-The mixing code in frequency_data.py has scale-dependent constants (an additive
-sensor-noise floor, a "chest-only" noise fraction), and the loss has
-scale-dependent terms (waveform L1, log-magnitude). Concatenating raw pools
-would therefore mean CirCor windows silently train at a different operating
-point than device windows -- and device val at a different one than device
-train. So every window that leaves this module is:
+The mono mixing code in frequency_data.py scales noise relative to clean RMS,
+and the loss has scale-dependent terms (waveform L1, log-magnitude).
+Concatenating raw pools would therefore mean CirCor windows silently train at a
+different operating point than device windows. So every window that leaves this
+module is:
 
     1. converted to float32 in +-1 (int16 divided by 32768, matching the
        convention of the source npz files -- nothing is re-quantised),
@@ -42,7 +40,9 @@ audit can always answer "how much of this pool is CirCor, and from whom".
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
+import re
 from typing import Any, Iterable, Sequence
 
 import numpy as np
@@ -60,6 +60,46 @@ CLIP_LEVEL = 32_767.0 / 32_768.0
 #: may still exceed +-1; the model normalises its input by RMS anyway.
 DEFAULT_TARGET_RMS = 0.02
 
+# The experiment is defined by exact recording names, not by whichever legacy
+# folder happens to contain each archive. Clean and noise are unpaired pools, so
+# their available participant IDs are intentionally asymmetric. Subject/session
+# 6 is the only final test source.
+DEVICE_PROTOCOL_ID = "single_stage_fixed_budget_v1"
+DEVICE_UPSTREAM_COMMIT = "c38092d286e03fea81f72fa66c7731100d9266ec"
+DEVICE_FILE_SPLITS: dict[str, dict[str, tuple[str, ...]]] = {
+    "clean": {
+        "train": (
+            "heart_aw1", "heart_aw2", "heart_aw4",
+            "heart_bw1", "heart_bw2", "heart_bw4", "heart_bw5",
+        ),
+        "test": ("heart_aw6", "heart_bw6"),
+    },
+    "noise": {
+        "train": ("noise1", "noise2", "noise3", "noise5"),
+        "test": ("noise6",),
+    },
+}
+
+
+def device_protocol_metadata() -> dict[str, Any]:
+    """JSON-safe copy of the fixed device data contract stored in checkpoints."""
+
+    return {
+        "id": DEVICE_PROTOCOL_ID,
+        "device_files": {
+            modality: {
+                split: list(stems)
+                for split, stems in split_table.items()
+            }
+            for modality, split_table in DEVICE_FILE_SPLITS.items()
+        },
+        "device_upstream_commit": DEVICE_UPSTREAM_COMMIT,
+        "selection_policy": "fixed training budget; no validation",
+        "circor_policy": "combined arm uses only the subject-disjoint CirCor train split",
+        "circor_subject_identity": "Patient ID aliases merged through Additional ID",
+        "final_test_subject": "device_6",
+    }
+
 
 @dataclass(frozen=True)
 class WindowPool:
@@ -67,7 +107,7 @@ class WindowPool:
 
     x: np.ndarray            # [N, WINDOW_SAMPLES] float32, +-1
     source: np.ndarray       # "device" | "circor"
-    subject: np.ndarray      # "aw1" ... / "circor_50186" / "noise3"
+    subject: np.ndarray      # "device_1" ... / "circor_50186"
     origin: np.ndarray       # file stem or CirCor record name
     stats: dict[str, Any]
 
@@ -210,30 +250,138 @@ def _finalise(
 # --------------------------------------------------------------------------- #
 # device recordings
 # --------------------------------------------------------------------------- #
-def _device_subject(stem: str) -> str:
-    """'heart_bw4_windows' -> 'bw4';  'noise6_windows' -> 'noise6'."""
-    name = stem.removesuffix("_windows")
-    return name.removeprefix("heart_")
+def canonical_device_subject(stem: str) -> str:
+    """Return one human ID across clean, noise, and walking archive names.
+
+    Examples:
+        ``heart_aw6_windows`` -> ``device_6``
+        ``heart_bw6_windows`` -> ``device_6``
+        ``heart_w6_windows``  -> ``device_6``
+        ``noise6_windows``    -> ``device_6``
+    """
+
+    name = stem.removesuffix("_windows").removesuffix("_preprocessed")
+    match = re.fullmatch(r"heart_(?:aw|bw|w)(\d+)", name)
+    if match is None:
+        match = re.fullmatch(r"noise(\d+)", name)
+    if match is None:
+        # Direct load_device_pool callers may use descriptive fixture names.
+        # Keep those auditable without pretending they are a known human.
+        return f"device_{name}"
+    return f"device_{match.group(1)}"
+
+
+def file_sha256(path: str | Path) -> str:
+    """Stream a file fingerprint for checkpoint provenance."""
+
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def canonical_device_stem(stem: str) -> str:
+    """Remove archive suffixes while preserving the recording identity."""
+
+    return stem.removesuffix(".npz").removesuffix("_windows").removesuffix("_preprocessed")
+
+
+def device_split_for_recording(stem: str, modality: str) -> str:
+    """Return the logical train/test role for one exact clean or noise recording."""
+
+    if modality not in DEVICE_FILE_SPLITS:
+        raise ValueError(
+            f"modality must be one of {tuple(DEVICE_FILE_SPLITS)}, got {modality!r}"
+        )
+    recording = canonical_device_stem(stem)
+    matches = [
+        split
+        for split, recordings in DEVICE_FILE_SPLITS[modality].items()
+        if recording in recordings
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"{modality} recording {recording!r} is not assigned to exactly one split"
+        )
+    return matches[0]
+
+
+def _split_device_files(
+    directory: Path,
+    split: str,
+    *,
+    modality: str,
+    skip_preprocessed: bool,
+) -> list[Path]:
+    """Discover legacy/current sibling folders, de-duplicate, then filter."""
+
+    if modality not in DEVICE_FILE_SPLITS:
+        raise ValueError(
+            f"modality must be one of {tuple(DEVICE_FILE_SPLITS)}, got {modality!r}"
+        )
+    if split not in DEVICE_FILE_SPLITS[modality]:
+        raise ValueError(
+            f"split must be one of {tuple(DEVICE_FILE_SPLITS[modality])} "
+            f"for {modality}, got {split!r}"
+        )
+    step_root = directory.parent
+    candidates = sorted(step_root.glob("*/*.npz"))
+    if directory.is_dir():
+        candidates.extend(sorted(directory.glob("*.npz")))
+    if skip_preprocessed:
+        candidates = [path for path in candidates if "preprocessed" not in path.name]
+
+    allowed = set(DEVICE_FILE_SPLITS[modality][split])
+    by_name: dict[str, Path] = {}
+    for path in candidates:
+        if canonical_device_stem(path.stem) not in allowed:
+            continue
+        previous = by_name.get(path.name)
+        # Prefer the canonical destination if both a legacy and newly fetched
+        # copy exist; otherwise either path contains the same upstream archive.
+        if previous is None or (path.parent.name == split and previous.parent.name != split):
+            by_name[path.name] = path
+    return sorted(by_name.values())
 
 
 def load_device_pool(
     directory: str | Path,
     *,
+    split: str | None = None,
+    modality: str | None = None,
     source_stride: int = 1,
     max_windows: int | None = None,
     target_rms: float | None = DEFAULT_TARGET_RMS,
     skip_preprocessed: bool = True,
     label: str | None = None,
 ) -> WindowPool:
-    """Load every ``*_windows.npz`` in one split directory of the device data."""
+    """Load device windows, optionally enforcing the exact recording manifest.
+
+    With ``split=None`` only ``directory`` is read (useful for a standalone
+    archive or fixture). With a split, all sibling legacy/current directories
+    are searched and filtered by the declared clean/noise recording names.
+    """
+
     directory = Path(directory)
-    files = sorted(directory.glob("*.npz"))
-    if skip_preprocessed:
-        # Raw is this project's default target; the *_preprocessed variants are
-        # the same windows bandpassed, so mixing both would duplicate windows.
-        files = [path for path in files if "preprocessed" not in path.name]
+    if split is None:
+        files = sorted(directory.glob("*.npz"))
+        if skip_preprocessed:
+            # Raw is this project's default target; the *_preprocessed variants are
+            # the same windows bandpassed, so mixing both would duplicate windows.
+            files = [path for path in files if "preprocessed" not in path.name]
+    else:
+        if modality is None:
+            raise ValueError("modality='clean' or 'noise' is required when split is set")
+        files = _split_device_files(
+            directory,
+            split,
+            modality=modality,
+            skip_preprocessed=skip_preprocessed,
+        )
     if not files:
-        raise FileNotFoundError(f"No .npz files found in {directory}")
+        suffix = f" for split={split!r}" if split is not None else ""
+        raise FileNotFoundError(f"No .npz files found in {directory}{suffix}")
 
     chunks, source, subject, origin = [], [], [], []
     for path in files:
@@ -243,7 +391,7 @@ def load_device_pool(
             x = np.asarray(payload["x"])
         chunks.append(x)
         source.extend(["device"] * len(x))
-        subject.extend([_device_subject(path.stem)] * len(x))
+        subject.extend([canonical_device_subject(path.stem)] * len(x))
         origin.extend([path.stem] * len(x))
     return _finalise(
         np.concatenate(chunks, axis=0),
@@ -252,7 +400,12 @@ def load_device_pool(
         max_windows=max_windows,
         target_rms=target_rms,
         label=label or f"device:{directory.parent.parent.name}/{directory.name}",
-        extra={"files": [path.name for path in files]},
+        extra={
+            "files": [path.name for path in files],
+            "split": split,
+            "modality": modality,
+            "device_protocol_id": DEVICE_PROTOCOL_ID,
+        },
     )
 
 
@@ -283,15 +436,34 @@ def load_circor_pool(
             f"CirCor pool not found: {pool_path}\n"
             "Build it once with:\n"
             "  PYTHONPATH=. python scripts/build_circor_pool.py "
-            "--root circor-heart-sound-1.0.3 --out data/circor/circor_pool_4khz_2s.npz"
+            "--root circor-heart-sound-1.0.3 "
+            "--out data/circor/circor_pool_4khz_2s_v2.npz"
         )
     if split not in ("train", "val"):
         raise ValueError(f"split must be 'train' or 'val', got {split!r}")
 
+    from src.circor import POOL_SCHEMA_VERSION
+
     with np.load(pool_path, allow_pickle=False) as payload:
-        missing = [key for key in ("x", "split", "subject", "record") if key not in payload]
+        missing = [
+            key
+            for key in (
+                "pool_schema_version", "x", "split", "subject",
+                "participant_id", "record",
+            )
+            if key not in payload
+        ]
         if missing:
-            raise KeyError(f"{pool_path} is missing {missing}; rebuild with build_circor_pool.py")
+            raise KeyError(
+                f"{pool_path} is missing {missing}; rebuild with build_circor_pool.py "
+                "so Additional ID aliases are merged"
+            )
+        stored_schema = int(payload["pool_schema_version"])
+        if stored_schema != POOL_SCHEMA_VERSION:
+            raise ValueError(
+                f"{pool_path}: CirCor pool schema {stored_schema} != "
+                f"{POOL_SCHEMA_VERSION}; rebuild the pool"
+            )
         x = np.asarray(payload["x"])
         pool_split = np.asarray(payload["split"]).astype(str)
         subject = np.asarray(payload["subject"]).astype(str)
@@ -330,6 +502,7 @@ def load_circor_pool(
         label=f"circor:{split}",
         extra={
             "pool_path": str(pool_path),
+            "pool_sha256": file_sha256(pool_path),
             "split": split,
             "dropped_by_heart_rate": dropped_hr,
             "heart_rate_max": heart_rate_max,
@@ -392,14 +565,18 @@ def build_clean_pool(
     circor_heart_rate_max: float | None = None,
     circor_heart_rate_min: float | None = None,
 ) -> WindowPool:
-    """device clean windows for ``split`` + (optionally) the CirCor windows for the same split.
+    """Build a logical device split, optionally adding CirCor to training.
 
     ``max_windows`` caps each source separately, so it thins the pool without
     changing the device:CirCor balance.
     """
+    if circor_pool is not None and split != "train":
+        raise ValueError("CirCor is allowed only in the combined training pool")
     parts = [
         load_device_pool(
             device_dir,
+            split=split,
+            modality="clean",
             source_stride=source_stride,
             max_windows=max_windows,
             target_rms=target_rms,
@@ -434,6 +611,8 @@ def build_noise_pool(
         [
             load_device_pool(
                 device_dir,
+                split=split,
+                modality="noise",
                 source_stride=source_stride,
                 max_windows=max_windows,
                 target_rms=target_rms,

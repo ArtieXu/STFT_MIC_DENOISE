@@ -1,77 +1,81 @@
 # Data
 
-Two clean-heart-sound sources and one noise source. Everything is 4 kHz, 2 s
-windows (8000 samples). `src/pools.py` is the only place that reads them.
+The experiment uses clean heart-sound windows and measured noise-only windows.
+Every sample is 2 seconds at 4 kHz (8,000 samples). Training mixtures are made
+online with one transparent equation:
 
-```
-data/
-  clean/step_1s/{train,val}/*.npz      device recordings, committed
-  noise/step_1s/{train,val}/*.npz      device motion/ambient noise, committed
-  circor/circor_pool_4khz_2s.npz       CirCor pool, you build this once
+```text
+noisy_chest = clean_heart_sound + noise_scaled_to_snr
 ```
 
-The experiment is `clean/` device-only versus `clean/` device + CirCor, with
-`noise/` and the validation split held fixed. So `clean/` is the only thing that
-changes between the two arms.
+There is no reference microphone input and no hidden transfer function,
+leakage, transient injection, or bandpass target.
 
-## device — committed
+## Device protocol
 
-From <https://github.com/jiayimaggieshao/denoise_stft> (`step_1s` = 2 s windows
-at a 1 s hop, so stored windows overlap 50%). `scripts/fetch_device_data.py`
-re-downloads them, or pulls another hop.
+The experiment has one fixed-budget training stage followed by one held-out
+test. The exact device recordings are:
 
-| Split | clean | noise |
-|-------|-------|-------|
-| `train` | `heart_aw1,aw2,aw6,bw1,bw2,bw5,bw6` — 3936 windows | `noise1,2,3,5` — 1367 stored, 1345 after dropping 22 clipped |
-| `val` | `heart_aw4`, `heart_bw4` — 1024 windows | `noise6` — 377 windows |
+| Role | Clean files | Noise-only files |
+|---|---|---|
+| train | `heart_aw1`, `heart_bw1`, `heart_aw2`, `heart_bw2`, `heart_aw4`, `heart_bw4`, `heart_bw5` | `noise1`, `noise2`, `noise3`, `noise5` |
+| final synthetic test | `heart_aw6`, `heart_bw6` | `noise6` |
+| qualitative only | `heart_w6` | none |
 
-`bw` = before walking, `aw` = after walking. Subject 4 is held out, so device
-subjects never cross the train/val line.
+Subject 6 is absent from every optimization input. `heart_w6` is a real walking
+recording with no clean reference, so it cannot produce a denoising score.
+Training and evaluation settings must be frozen before inspecting subject 6;
+subject-6 results must not be used to tune or select another checkpoint.
 
-### NPZ format
+Noise-only recordings are sampled independently of clean subjects. The four
+training noise recordings are scheduled exactly 1:1:1:1 per epoch, followed by
+a window from the scheduled recording; numeric suffixes do not constrain a
+synthetic pair. In the combined arm, every device/CirCor-clean ×
+noise-recording combination is equally represented. Recording-uniform sampling
+also prevents the longest noise file from dominating.
 
-| Key | Shape | Notes |
-|-----|-------|-------|
-| `x` | `(N, 8000)` int16 | full scale 32768 |
-| `start_idx` | `(N,)` int64 | index of the first sample |
-| `segment_id` | `(N,)` int32 | contiguous-index segment |
-| `start_wall_epoch_us` | `(N,)` int64 | wall clock, used to align the reference mic |
+There is no validation split, validation-based checkpoint selection, early
+stopping, or plateau scheduler. All arms train for the same fixed
+epoch/optimizer-step budget and are compared using `final.pt`; `last.pt` is
+only for resuming an interrupted run.
 
-Only `x` is used here; the mixing is synthetic, so the timestamps and segment
-ids are not needed for this experiment.
+The upstream archives still live under their legacy `train/` and `val/`
+directories. The loader uses the manifest above, so `heart_aw4` and
+`heart_bw4` participate in training without moving binary files.
 
-## CirCor — build once, not committed
+Device files come from
+<https://github.com/jiayimaggieshao/denoise_stft>. Stored `step_1s` windows have
+a 1-second hop and therefore overlap 50%. `scripts/fetch_device_data.py` pins
+upstream commit `c38092d286e03fea81f72fa66c7731100d9266ec` so re-fetching cannot
+silently change the experiment.
 
-449 MB of source audio, so only the sampled pool lives here.
+## CirCor
+
+CirCor supplies additional clean targets only. Only its stored `train` split is
+used; its stored `val` split and all CirCor noise/test roles are excluded.
+Patient IDs connected by the official `Additional ID` field are canonicalized
+as one real subject before window limiting and split assignment.
 
 ```bash
-wget -O circor.zip https://physionet.org/content/circor-heart-sound/get-zip/1.0.3/
+wget -c -O circor.zip https://physionet.org/content/circor-heart-sound/get-zip/1.0.3/
 unzip -q circor.zip
-PYTHONPATH=. python scripts/build_circor_pool.py --root circor-heart-sound-1.0.3
+PYTHONPATH=. python scripts/build_circor_pool.py \
+  --root circor-heart-sound-1.0.3
 ```
 
-Writes `circor/circor_pool_4khz_2s.npz` (float32 in ±1) with a `split` column
-that is subject-disjoint, plus per-window `subject`, `location`, `record`,
-`bpm`, `murmur`, `age`. `bpm` comes from consecutive S1 onsets in the TSV, which
-is how `--circor_heart_rate_max` can filter an already built pool.
+This writes `data/circor/circor_pool_4khz_2s_v2.npz`. The `v2` schema merges
+linked Patient IDs and rejects older cached pools. The combined training
+dataset schedules exactly half of its clean targets from device and half from
+the CirCor `train` split, regardless of the physical pool sizes. Device-only
+and combined runs use the same total `samples_per_epoch` and optimizer-step
+budget.
 
-Two filters are applied while sampling, and both matter:
+## NPZ format
 
-- **only inside contiguous nonzero-state TSV runs.** State 0 is CirCor's own
-  signal-quality label; the documented noise in those regions is stethoscope
-  rubbing, speech, crying and laughing. Handing that to a denoiser as a clean
-  target teaches it to output noise.
-- **subjects with `Murmur == Unknown` are dropped** — the 119 subjects whose
-  recordings did not meet the signal-quality standard.
+Device archives contain an `x` array with shape `(N, 8000)`. Optional timestamp
+and segment arrays are provenance only and are not used to synthesize training
+mixtures.
 
-CirCor is pediatric (0–21 y, ~107 bpm median) recorded with a digital
-stethoscope; the device data is adult at 61–79 bpm. Rhythm is the main cue the
-model has when heart sound and motion artifact overlap in frequency, so keep
-`--circor_heart_rate_max` in mind. `scripts/audit_pools.py` prints the bpm gap.
-
-## What is deliberately not here
-
-The upstream repo also ships `test_real/walking/` — real walking recordings with
-no clean reference. They cannot produce a number, so they cannot take part in
-this comparison, and they are left out. `scripts/fetch_device_data.py` can pull
-them if the question ever changes to a listening test.
+All windows pass through the same conversion, DC removal, purity check, and RMS
+normalization in `src/pools.py`. Provenance fields retain source, recording,
+and original file name for leakage auditing.

@@ -13,3 +13,6 @@ circor-heart-sound-*/
 circor.zip
 data/circor/*.npz
 data/circor/*.manifest.json
+
+# real walking recordings: re-fetchable, only used for the qualitative figure
+data/test_real/

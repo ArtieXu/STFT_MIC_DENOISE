@@ -10,20 +10,20 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import torch
-
-from src.frequency_model import CardioSpecNet, FrequencyModelConfig
-
-
 def run_forward_smoke() -> None:
+    # Import after test discovery. Some macOS Conda environments ship separate
+    # OpenMP runtimes through SciPy and PyTorch and require SciPy to initialize
+    # first; Colab is unaffected.
+    import torch
+
+    from src.frequency_model import CardioSpecNet, FrequencyModelConfig
+
     torch.manual_seed(0)
-    model = CardioSpecNet(model_config=FrequencyModelConfig(base_channels=8, grid_blocks=1))
-    chest = torch.randn(4, 8_000) * 0.01
-    reference = torch.randn(4, 8_000) * 0.01
-    available = torch.tensor([1.0, 1.0, 0.0, 1.0])
+    model = CardioSpecNet(model_config=FrequencyModelConfig(base_channels=8))
+    noisy = torch.randn(4, 8_000) * 0.01
     with torch.inference_mode():
-        output = model(chest, reference, available)
-    if output.shape != chest.shape:
+        output = model(noisy)
+    if output.shape != noisy.shape:
         raise RuntimeError(f"Unexpected output shape: {tuple(output.shape)}")
     if not torch.isfinite(output).all():
         raise RuntimeError("Forward pass produced non-finite values")

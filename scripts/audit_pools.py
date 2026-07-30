@@ -10,10 +10,9 @@ Answers four questions the combined training set makes easy to get wrong:
   format     is every source 2 s @ 4 kHz, float in +-1, DC-free?
   purity     how many windows are silent, clipped, or non-finite?
   scale      how far apart are the sources before normalisation?
-  leakage    does any subject appear in both train and val?
+  leakage    is subject/session 6 absent from every training source?
 
-Validation mirrors training: device-only unless --val_circor, because the two
-arms have to be scored on one identical set for the comparison to mean anything.
+CirCor is used only in combined training. The final test is device-only.
 
 Exit code is 1 if a hard check fails, so it can gate a training job.
 """
@@ -32,6 +31,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.pools import (  # noqa: E402
     DEFAULT_TARGET_RMS,
+    DEVICE_FILE_SPLITS,
+    DEVICE_PROTOCOL_ID,
     SAMPLE_RATE,
     WINDOW_SAMPLES,
     WindowPool,
@@ -41,7 +42,7 @@ from src.pools import (  # noqa: E402
     window_rms,
 )
 
-DEFAULT_CIRCOR_POOL = REPO_ROOT / "data" / "circor" / "circor_pool_4khz_2s.npz"
+DEFAULT_CIRCOR_POOL = REPO_ROOT / "data" / "circor" / "circor_pool_4khz_2s_v2.npz"
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,8 +53,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source_stride", type=int, default=1)
     parser.add_argument("--circor_pool", type=Path, default=DEFAULT_CIRCOR_POOL)
     parser.add_argument("--no_circor", action="store_true")
-    parser.add_argument("--val_circor", action="store_true",
-                        help="Mirror train_frequency.py --val_circor.")
     parser.add_argument("--circor_heart_rate_max", type=float, default=None)
     parser.add_argument("--pool_target_rms", type=float, default=DEFAULT_TARGET_RMS)
     parser.add_argument("--json", type=Path, default=None, help="Also write the report as JSON.")
@@ -107,16 +106,18 @@ def main() -> int:
     args = parse_args()
     circor_pool = None if args.no_circor else args.circor_pool
     if circor_pool is not None and not Path(circor_pool).is_file():
-        print(f"note: {circor_pool} not present -- auditing device-only.\n"
-              "      build it with scripts/build_circor_pool.py to audit the combined pool.\n")
-        circor_pool = None
+        raise SystemExit(
+            f"CirCor pool not found: {circor_pool}\n"
+            "build it with scripts/build_circor_pool.py, or pass --no_circor "
+            "to audit the device-only arm explicitly"
+        )
     target_rms = args.pool_target_rms if args.pool_target_rms > 0 else None
 
     clean_dir = args.data_root / "clean" / f"step_{args.step}"
     noise_dir = args.data_root / "noise" / f"step_{args.step}"
     pools: dict[str, WindowPool] = {}
-    for split in ("train", "val"):
-        split_circor = circor_pool if (split == "train" or args.val_circor) else None
+    for split in ("train", "test"):
+        split_circor = circor_pool if split == "train" else None
         pools[f"clean_{split}"] = build_clean_pool(
             clean_dir / split, split,
             circor_pool=split_circor,
@@ -143,8 +144,7 @@ def main() -> int:
 
     print("=" * 78)
     arm = "A (device-only)" if circor_pool is None else "B (device + CirCor)"
-    print(f"POOLS -- arm {arm}, validation "
-          f"{'device + CirCor' if args.val_circor else 'device-only'}")
+    print(f"POOLS -- arm {arm}; fixed-budget train / device-only final test")
     print("=" * 78)
     for name, pool in pools.items():
         print(describe(pool))
@@ -188,29 +188,88 @@ def main() -> int:
     print("\n" + "=" * 78)
     print("SPLIT HYGIENE")
     print("=" * 78)
-    overlaps = {}
-    for role in ("clean", "noise"):
-        train_subjects = set(pools[f"{role}_train"].subject.tolist())
-        val_subjects = set(pools[f"{role}_val"].subject.tolist())
-        shared = sorted(train_subjects & val_subjects)
-        overlaps[role] = shared
-        verdict = "OK (disjoint)" if not shared else f"LEAK: {shared[:8]}"
-        print(f"{role:<8} train {len(train_subjects):>4} subjects, "
-              f"val {len(val_subjects):>4} subjects -> {verdict}")
-        if shared:
-            failures.append(f"{role}: subjects in both train and val: {shared[:8]}")
-    report["subject_overlap"] = overlaps
+    split_subjects = {
+        split: (
+            set(pools[f"clean_{split}"].subject.tolist())
+            | set(pools[f"noise_{split}"].subject.tolist())
+        )
+        for split in ("train", "test")
+    }
+    shared = sorted(split_subjects["train"] & split_subjects["test"])
+    report["subject_overlap"] = {"train_test": shared}
+    verdict = "OK (disjoint)" if not shared else f"LEAK: {shared}"
+    print(
+        f"train vs test: {len(split_subjects['train'])}/{len(split_subjects['test'])} "
+        f"subjects -> {verdict}"
+    )
+    if shared:
+        failures.append(f"train/test shared subjects: {shared}")
 
-    device_clean_val = [
-        subject for subject in set(pools["clean_val"].subject.tolist())
-        if not subject.startswith("circor_")
-    ]
-    print(f"\ndevice val subjects: {sorted(device_clean_val)}")
-    if args.val_circor:
-        print("CirCor val rows come from the pool's subject-disjoint val split. Note that "
-              "with --val_circor the two arms are no longer scored on the same set.")
-    else:
-        print("Validation is device-only, so both arms are scored on the same held-out subject.")
+    expected_subjects = {
+        "clean_train": {"device_1", "device_2", "device_4", "device_5"},
+        "noise_train": {"device_1", "device_2", "device_3", "device_5"},
+        "clean_test": {"device_6"},
+        "noise_test": {"device_6"},
+    }
+    expected_origins = {
+        f"{modality}_{split}": {
+            f"{stem}_windows" for stem in DEVICE_FILE_SPLITS[modality][split]
+        }
+        for modality in ("clean", "noise")
+        for split in ("train", "test")
+    }
+    manifest_report = {}
+    for name, expected in expected_subjects.items():
+        actual = {
+            subject
+            for subject, source in zip(pools[name].subject, pools[name].source)
+            if source == "device"
+        }
+        manifest_report[f"{name}_subjects"] = sorted(actual)
+        if actual != expected:
+            failures.append(
+                f"{name}: device subjects {sorted(actual)} != {sorted(expected)}"
+            )
+    for name, expected in expected_origins.items():
+        actual = {
+            origin
+            for origin, source in zip(pools[name].origin, pools[name].source)
+            if source == "device"
+        }
+        manifest_report[f"{name}_origins"] = sorted(actual)
+        if actual != expected:
+            failures.append(
+                f"{name}: recordings {sorted(actual)} != {sorted(expected)}"
+            )
+    report["device_manifest"] = manifest_report
+    report["device_protocol_id"] = DEVICE_PROTOCOL_ID
+    walking_path = (
+        args.data_root
+        / "test_real"
+        / "walking"
+        / f"step_{args.step}"
+        / "heart_w6_windows.npz"
+    )
+    report["qualitative_walking_recording"] = {
+        "path": str(walking_path),
+        "exists": walking_path.is_file(),
+        "subject": "device_6",
+        "role": "qualitative_only",
+    }
+    if not walking_path.is_file():
+        failures.append(
+            f"missing qualitative subject-6 walking archive: {walking_path}"
+        )
+
+    for split in ("train", "test"):
+        device_subjects = sorted(
+            subject
+            for subject in split_subjects[split]
+            if subject.startswith("device_")
+        )
+        print(f"device {split:<5} subjects: {device_subjects}")
+    print("Clean and noise are mixed independently inside train.")
+    print("Subject/session 6 is final-test-only across clean, noise, and real walking.")
 
     print("\n" + "=" * 78)
     if warnings:
