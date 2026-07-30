@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# training artefacts
+checkpoints/
+outputs/
+wandb/
+*.log
+
+# CirCor: the 449 MB source tree and the pool built from it stay local
+circor-heart-sound-*/
+circor.zip
+data/circor/*.npz
+data/circor/*.manifest.json

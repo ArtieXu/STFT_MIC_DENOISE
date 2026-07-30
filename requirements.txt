@@ -1,0 +1,6 @@
+torch>=2.4.0
+numpy>=1.26
+scipy>=1.11          # reads CirCor wavs; paired t-test in compare_datasets.py
+matplotlib>=3.8      # comparison figure
+tqdm>=4.66
+# optional: wandb>=0.17   (train_frequency.py --use_wandb)
