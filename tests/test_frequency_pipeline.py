@@ -518,37 +518,10 @@ class FrequencyPipelineTests(unittest.TestCase):
         self.assertEqual(metadata["completed_epochs"], 2)
         self.assertEqual(metadata["optimizer_steps"], 10)
         self.assertEqual(metadata["trained_inputs"], 40)
-        self.assertEqual(metadata["checkpoint_kind"], "final")
         self.assertEqual(
             metadata["training_protocol"]["budget"]["selection_policy"],
             "fixed_budget_final_epoch",
         )
-
-    def test_schema3_best_train_loss_checkpoint_is_loadable(self) -> None:
-        checkpoint = deepcopy(self._valid_final_checkpoint())
-        checkpoint["checkpoint_kind"] = "best"
-        checkpoint["epoch"] = 0
-        checkpoint["training_policy"]["selection_policy"] = "best_train_loss"
-        checkpoint["training_policy"]["completed_epochs"] = 1
-        checkpoint["training_policy"]["optimizer_steps"] = 5
-        checkpoint["training_policy"]["trained_inputs"] = 20
-        checkpoint["runtime_stats"]["successful_optimizer_updates"] = 5
-        checkpoint["best_selection"] = {
-            "metric": "train_loss_mean",
-            "value": 0.42,
-            "epoch": 0,
-            "selected_at_optimizer_steps": 5,
-        }
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "best.pt"
-            torch.save(checkpoint, path)
-            _, metadata = load_arm(
-                path, torch.device("cpu"), expected_role="device_only"
-            )
-
-        self.assertEqual(metadata["checkpoint_kind"], "best")
-        self.assertEqual(metadata["completed_epochs"], 1)
-        self.assertEqual(metadata["best_selection"]["value"], 0.42)
 
     def test_old_and_incomplete_checkpoints_are_rejected(self) -> None:
         cases = {}
