@@ -9,10 +9,8 @@ dependencies = [
     "scipy>=1.11",
     "matplotlib>=3.8",
     "tqdm>=4.66",
+    "wandb>=0.17",
 ]
-
-[project.optional-dependencies]
-wandb = ["wandb>=0.17"]
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu124", marker = "sys_platform == 'linux'" }]

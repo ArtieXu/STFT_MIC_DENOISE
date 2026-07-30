@@ -20,7 +20,7 @@ comparison no longer means anything.
     # check what each arm will see
     PYTHONPATH=. python scripts/audit_pools.py
 
-    # the two arms
+    # the two arms (formal runs log to wandb by default; smoke does not)
     PYTHONPATH=. python train_frequency.py --no_circor --output_dir checkpoints/device_only
     PYTHONPATH=. python train_frequency.py            --output_dir checkpoints/combined
 
@@ -116,8 +116,15 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--seed", type=int, default=2026)
     train.add_argument("--output_dir", type=Path, default=Path("checkpoints/frequency"))
     train.add_argument("--resume", type=Path, default=None)
-    train.add_argument("--use_wandb", action="store_true")
+    train.add_argument("--no_wandb", action="store_true",
+                       help="Disable Weights & Biases. Formal runs log to wandb by default; smoke never does.")
     train.add_argument("--wandb_project", type=str, default="stft-pcg-denoise")
+    train.add_argument("--wandb_entity", type=str, default=None,
+                       help="W&B team or user. Falls back to WANDB_ENTITY env var.")
+    train.add_argument("--wandb_group", type=str, default="dataset-ablation",
+                       help="Group arm-A / arm-B runs on the same chart.")
+    train.add_argument("--wandb_run_name", type=str, default=None,
+                       help="Run name. Defaults to the output_dir folder name.")
     train.add_argument("--smoke", action="store_true",
                        help="Small deterministic CPU run that validates the full train/eval/checkpoint path.")
     return parser.parse_args()
@@ -143,6 +150,18 @@ def set_seed(seed: int) -> None:
 
 def move_batch(batch: dict[str, Tensor], device: torch.device) -> dict[str, Tensor]:
     return {key: value.to(device, non_blocking=True) for key, value in batch.items()}
+
+
+def should_use_wandb(args: argparse.Namespace) -> bool:
+    return not args.no_wandb and not args.smoke
+
+
+def wandb_config(args: argparse.Namespace, **extra: object) -> dict[str, object]:
+    payload = {**vars(args), **extra}
+    return {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in payload.items()
+    }
 
 
 def resolve_circor_pool(args: argparse.Namespace) -> Path | None:
@@ -345,12 +364,37 @@ def main() -> None:
         json.dumps(pool_stats, indent=2, default=str) + "\n", encoding="utf-8"
     )
 
+    use_wandb = should_use_wandb(args)
     wandb_run = None
-    if args.use_wandb:
-        import wandb
+    if use_wandb:
+        try:
+            import wandb
+        except ImportError as error:
+            raise SystemExit(
+                "Formal training logs to Weights & Biases by default.\n"
+                "  pip install wandb\n"
+                "  wandb login\n"
+                "Or pass --no_wandb to skip logging."
+            ) from error
+        arm_tag = pool_stats["arm"]
         wandb_run = wandb.init(
             project=args.wandb_project,
-            config={**vars(args), "parameters": parameter_count},
+            entity=args.wandb_entity,
+            group=args.wandb_group,
+            name=args.wandb_run_name or args.output_dir.name,
+            tags=[arm_tag, f"seed{args.seed}"],
+            dir=str(args.output_dir),
+            config=wandb_config(
+                args,
+                parameters=parameter_count,
+                arm=arm_tag,
+                device=str(device),
+            ),
+        )
+        wandb_run.summary["pool_stats"] = pool_stats
+        print(
+            f"W&B run: {wandb_run.url} "
+            f"(project={args.wandb_project}, group={args.wandb_group}, name={wandb_run.name})"
         )
 
     history_path = args.output_dir / "history.jsonl"
@@ -422,13 +466,18 @@ def main() -> None:
         )
         if wandb_run is not None:
             wandb_run.log({
-                "epoch": epoch,
+                "epoch": epoch + 1,
                 "learning_rate": optimizer.param_groups[0]["lr"],
+                "elapsed_seconds": elapsed,
+                "val/score": score,
+                "val/best_score": best_score,
                 **{f"train/{key}": value for key, value in record["train"].items()},
                 **{f"val/{key}": value for key, value in validation.items()},
-            })
+            }, step=epoch + 1)
 
     if wandb_run is not None:
+        wandb_run.summary["best_score_db"] = best_score
+        wandb_run.summary["best_checkpoint"] = str(args.output_dir / "best.pt")
         wandb_run.finish()
     print(f"Best checkpoint: {args.output_dir / 'best.pt'} (balanced improvement score={best_score:.3f} dB)")
 
