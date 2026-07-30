@@ -27,7 +27,13 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.arms import load_arm  # noqa: E402
 from src.pools import SAMPLE_RATE, WINDOW_SAMPLES, remove_dc, to_float  # noqa: E402
-from src.window_alignment import load_window_archive, overlap_add_windows  # noqa: E402
+from src.window_alignment import (  # noqa: E402
+    hop_samples_from_step,
+    load_window_archive,
+    overlap_add_runs,
+    resolve_start_samples,
+    split_contiguous_runs,
+)
 
 ARM_LABEL = {
     "device_only": "STFT / device",
@@ -45,6 +51,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device_only", type=Path, default=None)
     parser.add_argument("--combined", type=Path, default=None)
     parser.add_argument("--waveform", type=Path, default=None)
+    parser.add_argument("--step", type=str, default="1s",
+                        help="Window hop encoded in the archive path (step_1s -> 1 s hop).")
     parser.add_argument("--segment", type=int, default=None,
                         help="Keep one segment_id only (default: all windows).")
     parser.add_argument("--start_seconds", type=float, default=None,
@@ -67,7 +75,11 @@ def choose_device(requested: str) -> torch.device:
     return torch.device(requested)
 
 
-def prepare_windows(archive_path: Path, segment: int | None) -> tuple[np.ndarray, np.ndarray]:
+def prepare_windows(
+    archive_path: Path,
+    segment: int | None,
+    hop_samples: int,
+) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
     archive = load_window_archive(archive_path)
     if archive is None:
         raise SystemExit(f"archive not found: {archive_path}")
@@ -80,15 +92,43 @@ def prepare_windows(archive_path: Path, segment: int | None) -> tuple[np.ndarray
     indices = np.arange(len(archive.x))
     if segment is not None:
         indices = indices[archive.segment_id == segment]
+    elif len(np.unique(archive.segment_id[indices])) > 1:
+        counts = {
+            int(value): int(np.sum(archive.segment_id[indices] == value))
+            for value in np.unique(archive.segment_id[indices])
+        }
+        best = max(counts, key=counts.get)
+        print(
+            "multiple segment_id values found; using the largest segment "
+            f"{best} ({counts[best]} windows). Pass --segment to override."
+        )
+        indices = indices[archive.segment_id == best]
+
     if len(indices) == 0:
         raise SystemExit("no windows selected")
 
     order = np.argsort(archive.start_idx[indices], kind="stable")
     indices = indices[order]
     windows = remove_dc(to_float(archive.x[indices]))
-    starts = archive.start_idx[indices].astype(np.int64)
-    starts = starts - int(starts.min())
-    return windows, starts
+    raw_starts = archive.start_idx[indices].astype(np.int64)
+    starts = resolve_start_samples(
+        raw_starts,
+        window_samples=WINDOW_SAMPLES,
+        hop_samples=hop_samples,
+    )
+    runs = split_contiguous_runs(
+        starts,
+        window_samples=WINDOW_SAMPLES,
+        hop_samples=hop_samples,
+    )
+    meta = {
+        "segment_ids": sorted(int(value) for value in np.unique(archive.segment_id[indices])),
+        "raw_start_min": int(raw_starts.min()),
+        "raw_start_max": int(raw_starts.max()),
+        "resolved_runs": [len(run) for run in runs],
+        "hop_samples": hop_samples,
+    }
+    return windows, starts, meta
 
 
 def run_model(
@@ -105,8 +145,13 @@ def run_model(
     return np.concatenate(outputs, axis=0)
 
 
-def reconstruct(windows: np.ndarray, starts: np.ndarray) -> np.ndarray:
-    return overlap_add_windows(windows, starts, synthesis_window="hann")
+def reconstruct(windows: np.ndarray, starts: np.ndarray, hop_samples: int) -> np.ndarray:
+    return overlap_add_runs(
+        windows,
+        starts,
+        hop_samples=hop_samples,
+        synthesis_window="hann",
+    )
 
 
 def crop_seconds(
@@ -154,17 +199,32 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = choose_device(args.device)
-    windows, starts = prepare_windows(input_path, args.segment)
-    duration_s = (int(starts.max()) + WINDOW_SAMPLES) / SAMPLE_RATE
+    hop_samples = hop_samples_from_step(args.step, SAMPLE_RATE)
+    windows, starts, prep_meta = prepare_windows(input_path, args.segment, hop_samples)
+    runs = prep_meta["resolved_runs"]
+    run_duration_s = sum(
+        (run_len - 1) * hop_samples + WINDOW_SAMPLES for run_len in runs
+    ) / SAMPLE_RATE
     hop_msg = "n/a"
     if len(starts) > 1:
-        hop_msg = f"{(np.diff(starts).mean() / SAMPLE_RATE):.2f}s mean"
+        hop_msg = f"{(np.diff(starts).mean() / SAMPLE_RATE):.2f}s mean raw spacing"
     print(
         f"input={input_path.name}; windows={len(windows):,}; "
-        f"hop≈{hop_msg}; covered≈{duration_s:.1f}s"
+        f"contiguous_runs={len(runs)} sizes={runs}; "
+        f"hop={hop_samples / SAMPLE_RATE:g}s; "
+        f"output≈{run_duration_s:.1f}s continuous"
     )
+    if len(runs) > 1:
+        print(
+            "timeline gaps in start_idx were removed by concatenating each contiguous "
+            "run back-to-back (no silent holes between valid windows)."
+        )
 
-    chest = crop_seconds(reconstruct(windows, starts), args.start_seconds, args.end_seconds)
+    chest = crop_seconds(
+        reconstruct(windows, starts, hop_samples),
+        args.start_seconds,
+        args.end_seconds,
+    )
     write_wav(output_dir / "chest.wav", chest)
     np.save(output_dir / "chest.npy", chest.astype(np.float32))
 
@@ -174,7 +234,10 @@ def main() -> None:
         "window_samples": WINDOW_SAMPLES,
         "n_windows": int(len(windows)),
         "overlap_add": "hann",
-        "starts_origin": "min_start_idx_subtracted",
+        "step": args.step,
+        "hop_samples": hop_samples,
+        "reconstruction": "contiguous_runs_concatenated",
+        "prep": prep_meta,
         "crop_seconds": [args.start_seconds, args.end_seconds],
         "qualitative_only": True,
         "outputs": {"chest": str(output_dir / "chest.wav")},
@@ -187,7 +250,7 @@ def main() -> None:
         model, info = load_arm(path, device, expected_role=label)
         denoised_windows = run_model(model, windows, device, args.batch_size)
         audio = crop_seconds(
-            reconstruct(denoised_windows, starts),
+            reconstruct(denoised_windows, starts, hop_samples),
             args.start_seconds,
             args.end_seconds,
         )
