@@ -20,6 +20,7 @@ Old reference-conditioned checkpoints are deliberately rejected by
 from __future__ import annotations
 
 import hashlib
+import math
 from pathlib import Path
 from typing import Any
 
@@ -122,11 +123,11 @@ def _validate_checkpoint(
         raise _checkpoint_error(
             path, f"schema_version must be 3, got {checkpoint['schema_version']!r}"
         )
-    if checkpoint["checkpoint_kind"] != "final":
+    if checkpoint["checkpoint_kind"] not in {"final", "best"}:
         raise _checkpoint_error(
             path,
-            "only a completed fixed-budget final checkpoint is comparable; "
-            f"got checkpoint_kind={checkpoint['checkpoint_kind']!r}",
+            "only a completed fixed-budget final checkpoint or a best-train-loss "
+            f"checkpoint is comparable; got checkpoint_kind={checkpoint['checkpoint_kind']!r}",
         )
     if checkpoint["data_protocol"] != device_protocol_metadata():
         raise _checkpoint_error(path, "data protocol does not match the current fixed manifest")
@@ -200,9 +201,10 @@ def _validate_checkpoint(
     trained_inputs = int(policy.get("trained_inputs", -1))
     checkpoint_epoch = int(checkpoint.get("epoch", -1))
     precision_policy = policy.get("precision_policy")
-    if (
-        policy.get("selection_policy") != "fixed_budget_final_epoch"
-        or policy.get("uses_validation") is not False
+    selection_policy = policy.get("selection_policy")
+    checkpoint_kind = checkpoint["checkpoint_kind"]
+    shared_policy_checks = (
+        policy.get("uses_validation") is not False
         or policy.get("optimizer") != "AdamW"
         or policy.get("learning_rate_schedule") != "constant"
         or policy.get("optimizer_update_policy") != OPTIMIZER_UPDATE_POLICY
@@ -214,15 +216,40 @@ def _validate_checkpoint(
         or int(policy.get("amp_max_retries_per_batch", -1))
         != AMP_MAX_RETRIES
         or target_epochs <= 0
-        or completed_epochs != target_epochs
-        or checkpoint_epoch + 1 != completed_epochs
         or steps_per_epoch <= 0
         or batch_size <= 0
         or steps_per_epoch * batch_size != inputs_per_epoch
-        or optimizer_steps != completed_epochs * steps_per_epoch
         or inputs_per_epoch <= 0
-        or trained_inputs != completed_epochs * inputs_per_epoch
-    ):
+    )
+    if checkpoint_kind == "final":
+        budget_checks = (
+            selection_policy != "fixed_budget_final_epoch"
+            or completed_epochs != target_epochs
+            or checkpoint_epoch + 1 != completed_epochs
+            or optimizer_steps != completed_epochs * steps_per_epoch
+            or trained_inputs != completed_epochs * inputs_per_epoch
+        )
+    else:
+        best_selection = checkpoint.get("best_selection")
+        if not isinstance(best_selection, dict):
+            raise _checkpoint_error(path, "best checkpoint lacks best_selection metadata")
+        if (
+            selection_policy != "best_train_loss"
+            or best_selection.get("metric") != "train_loss_mean"
+            or int(best_selection.get("epoch", -1)) != checkpoint_epoch
+            or not math.isfinite(float(best_selection.get("value", float("nan"))))
+            or int(best_selection.get("selected_at_optimizer_steps", -1))
+            != completed_epochs * steps_per_epoch
+        ):
+            raise _checkpoint_error(path, f"inconsistent best-selection metadata: {best_selection}")
+        budget_checks = (
+            completed_epochs < 1
+            or completed_epochs > target_epochs
+            or checkpoint_epoch + 1 != completed_epochs
+            or optimizer_steps != completed_epochs * steps_per_epoch
+            or trained_inputs != completed_epochs * inputs_per_epoch
+        )
+    if shared_policy_checks or budget_checks:
         raise _checkpoint_error(path, f"incomplete or inconsistent fixed budget: {policy}")
     runtime_stats = checkpoint["runtime_stats"]
     if (
@@ -363,6 +390,7 @@ def load_arm(
         "path": str(path),
         "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         "role": checkpoint["role"],
+        "checkpoint_kind": checkpoint["checkpoint_kind"],
         "input_mode": checkpoint["input_mode"],
         "arch": arch,
         "arch_label": ARCH_LABEL.get(arch, arch),
@@ -376,6 +404,7 @@ def load_arm(
         "train_clean_windows": train_clean.get("n_windows"),
         "train_clean_sources": train_clean.get("source_counts"),
         "model_config": checkpoint["model_config"],
+        "best_selection": checkpoint.get("best_selection"),
         "training_protocol": {
             "training": {
                 key: (checkpoint.get("training_args") or {}).get(key)

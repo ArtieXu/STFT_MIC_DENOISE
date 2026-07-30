@@ -26,6 +26,7 @@ after the same fixed number of optimiser steps.
 
     # the three arms -- identical apart from the flags shown
     PYTHONPATH=. python train_frequency.py --no_circor --output_dir checkpoints/device_only
+    PYTHONPATH=. python train_frequency.py --no_circor --save_best --output_dir checkpoints/device_only
     PYTHONPATH=. python train_frequency.py            --output_dir checkpoints/combined
     PYTHONPATH=. python train_frequency.py --no_circor --arch cleanunet \
         --output_dir checkpoints/waveform
@@ -132,6 +133,9 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--resume", type=Path, default=None)
     train.add_argument("--use_wandb", action="store_true")
     train.add_argument("--wandb_project", type=str, default="stft-pcg-denoise")
+    train.add_argument("--save_best", action="store_true",
+                       help="Track the lowest epoch train loss and write checkpoints/best.pt "
+                            "for inference. Selection uses training loss only (no validation split).")
     train.add_argument("--smoke", action="store_true",
                        help="Small deterministic CPU run that validates train/resume/final checkpointing.")
     return parser.parse_args()
@@ -258,6 +262,68 @@ def restore_rng_state(state: dict) -> None:
     torch.set_rng_state(state["torch"])
     if torch.cuda.is_available() and "cuda" in state:
         torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def make_training_checkpoint(
+    *,
+    checkpoint_kind: str,
+    epoch: int,
+    model: torch.nn.Module,
+    role: str,
+    arch: str,
+    mixing_config: MixingConfig,
+    loss_config: FrequencyLossConfig,
+    pool_stats: dict,
+    training_policy: dict,
+    runtime_stats: dict,
+    training_args: dict,
+    parameters: int,
+    optimizer: torch.optim.Optimizer | None = None,
+    scaler=None,
+    rng_state: dict | None = None,
+    best_selection: dict | None = None,
+) -> dict:
+    checkpoint = {
+        "epoch": epoch,
+        "checkpoint_kind": checkpoint_kind,
+        "model_state_dict": model.state_dict(),
+        "schema_version": 3,
+        "input_mode": "single_mic",
+        "role": role,
+        "arch": arch,
+        "model_config": model.config_dict,
+        "mixing_config": mixing_config.to_dict(),
+        "loss_config": loss_config.to_dict(),
+        "pool_stats": pool_stats,
+        "data_protocol": device_protocol_metadata(),
+        "training_policy": training_policy,
+        "runtime_stats": runtime_stats,
+        "training_args": training_args,
+        "parameter_count": parameters,
+    }
+    if optimizer is not None:
+        checkpoint["optimizer_state_dict"] = optimizer.state_dict()
+    if scaler is not None:
+        checkpoint["scaler_state_dict"] = scaler.state_dict()
+    if rng_state is not None:
+        checkpoint["rng_state"] = rng_state
+    if best_selection is not None:
+        checkpoint["best_selection"] = best_selection
+    return checkpoint
+
+
+def restore_best_tracking(output_dir: Path) -> tuple[float, int]:
+    """Recover best-epoch tracking after a resume."""
+
+    path = output_dir / "best.pt"
+    if not path.is_file():
+        return float("inf"), -1
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    selection = checkpoint.get("best_selection") or {}
+    metric = selection.get("metric")
+    if metric != "train_loss_mean":
+        raise SystemExit(f"{path} has unsupported best_selection.metric {metric!r}")
+    return float(selection["value"]), int(selection["epoch"])
 
 
 def resolve_circor_pool(args: argparse.Namespace) -> Path | None:
@@ -528,6 +594,10 @@ def main() -> None:
         amp_overflow_retries = 0
         amp_forward_fallbacks = 0
         fp32_fallback_updates = 0
+    best_train_loss = float("inf")
+    best_epoch = -1
+    if args.save_best and start_epoch > 0:
+        best_train_loss, best_epoch = restore_best_tracking(args.output_dir)
     parameters = parameter_count(model)
     print(
         f"Device={device}; arch={ARCH_LABEL[args.arch]}; parameters={parameters:,}; "
@@ -546,6 +616,15 @@ def main() -> None:
         f"Fixed budget: {args.epochs} epochs x {len(train_loader)} steps x "
         f"{args.batch_size} inputs = {args.epochs * args.samples_per_epoch:,} inputs"
     )
+    if args.save_best:
+        print(
+            "Best checkpoint: enabled (lowest epoch train loss -> best.pt; "
+            "no validation split)"
+        )
+    training_args = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
 
     pool_stats = {
         "arm": role,
@@ -649,34 +728,78 @@ def main() -> None:
             "fp32_fallback_updates": fp32_fallback_updates,
             "final_loss_scale": float(scaler.get_scale()) if use_amp else None,
         }
-        checkpoint = {
-            "epoch": epoch,
-            "checkpoint_kind": "resume",
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scaler_state_dict": scaler.state_dict(),
-            "rng_state": capture_rng_state(),
-            "schema_version": 3,
-            "input_mode": "single_mic",
-            "role": role,
-            "arch": args.arch,
-            "model_config": model.config_dict,
-            "mixing_config": mixing_config.to_dict(),
-            "loss_config": loss_config.to_dict(),
-            "pool_stats": pool_stats,
-            "data_protocol": device_protocol_metadata(),
-            "training_policy": training_policy,
-            "runtime_stats": runtime_stats,
-            "training_args": {
-                key: str(value) if isinstance(value, Path) else value
-                for key, value in vars(args).items()
-            },
-            "parameter_count": parameters,
-        }
+        epoch_loss = float(record["train"]["loss_mean"])
+        checkpoint = make_training_checkpoint(
+            checkpoint_kind="resume",
+            epoch=epoch,
+            model=model,
+            role=role,
+            arch=args.arch,
+            mixing_config=mixing_config,
+            loss_config=loss_config,
+            pool_stats=pool_stats,
+            training_policy=training_policy,
+            runtime_stats=runtime_stats,
+            training_args=training_args,
+            parameters=parameters,
+            optimizer=optimizer,
+            scaler=scaler,
+            rng_state=capture_rng_state(),
+        )
         if epoch + 1 == args.epochs:
-            final_checkpoint = {**checkpoint, "checkpoint_kind": "final"}
+            final_checkpoint = make_training_checkpoint(
+                checkpoint_kind="final",
+                epoch=epoch,
+                model=model,
+                role=role,
+                arch=args.arch,
+                mixing_config=mixing_config,
+                loss_config=loss_config,
+                pool_stats=pool_stats,
+                training_policy=training_policy,
+                runtime_stats=runtime_stats,
+                training_args=training_args,
+                parameters=parameters,
+            )
             save_checkpoint_atomic(final_checkpoint, args.output_dir / "final.pt")
         save_checkpoint_atomic(checkpoint, args.output_dir / "last.pt")
+
+        if args.save_best and epoch_loss < best_train_loss:
+            best_train_loss = epoch_loss
+            best_epoch = epoch
+            best_policy = {
+                **training_policy,
+                "selection_policy": "best_train_loss",
+            }
+            best_runtime_stats = {
+                **runtime_stats,
+                "successful_optimizer_updates": (epoch + 1) * len(train_loader),
+            }
+            best_checkpoint = make_training_checkpoint(
+                checkpoint_kind="best",
+                epoch=epoch,
+                model=model,
+                role=role,
+                arch=args.arch,
+                mixing_config=mixing_config,
+                loss_config=loss_config,
+                pool_stats=pool_stats,
+                training_policy=best_policy,
+                runtime_stats=best_runtime_stats,
+                training_args=training_args,
+                parameters=parameters,
+                best_selection={
+                    "metric": "train_loss_mean",
+                    "value": best_train_loss,
+                    "epoch": best_epoch,
+                    "selected_at_optimizer_steps": (epoch + 1) * len(train_loader),
+                },
+            )
+            save_checkpoint_atomic(best_checkpoint, args.output_dir / "best.pt")
+            print(
+                f"  new best train loss={best_train_loss:.4f} "
+                f"-> {args.output_dir / 'best.pt'}"
+            )
 
         print(
             f"epoch={epoch + 1:03d} loss={record['train']['loss_mean']:.4f} "
@@ -685,19 +808,33 @@ def main() -> None:
             f"amp_retries={epoch_amp_retries} time={elapsed:.1f}s"
         )
         if wandb_run is not None:
-            wandb_run.log({
+            log_payload = {
                 "epoch": epoch,
                 "learning_rate": optimizer.param_groups[0]["lr"],
                 **{f"train/{key}": value for key, value in record["train"].items()},
-            })
+            }
+            if args.save_best:
+                log_payload["best/train_loss_mean"] = best_train_loss
+                log_payload["best/epoch"] = best_epoch
+            wandb_run.log(log_payload)
 
     if wandb_run is not None:
+        if args.save_best and best_epoch >= 0:
+            wandb_run.summary["best_train_loss_mean"] = best_train_loss
+            wandb_run.summary["best_epoch"] = best_epoch
         wandb_run.finish()
     print(
         f"Final checkpoint: {args.output_dir / 'final.pt'} "
         f"({successful_optimizer_updates:,} optimiser steps, "
         f"{successful_optimizer_updates * args.batch_size:,} inputs)"
     )
+    if args.save_best and best_epoch >= 0:
+        print(
+            f"Best checkpoint: {args.output_dir / 'best.pt'} "
+            f"(epoch {best_epoch + 1}, train loss {best_train_loss:.4f})"
+        )
+    elif args.save_best:
+        print("Best checkpoint: not written (no epoch completed)")
 
 
 if __name__ == "__main__":
